@@ -131,26 +131,42 @@ def generate_flashcards_from_context(num_cards):
     docs = db.similarity_search("extract key facts for flashcards", k=6)
     context = " ".join([d.page_content for d in docs])
     model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", client=genai, temperature=0.2)
-    prompt = f"Generate {num_cards} concise flashcards from the context. Return JSON array: [{{'q':'...','a':'...'}}, ...]. Context:\n{context[:12000]}"
-    resp = model.invoke(prompt).content
-    parsed = None
+
+    prompt = f"""
+    Generate {num_cards} concise flashcards in this exact format:
+
+    Q: <question text>
+    A: <answer text>
+
+    Keep them factual and based only on the following context:
+    {context[:12000]}
+    """
+
+    resp = model.invoke(prompt).content.strip()
+
+    # First try: JSON parsing
     try:
-        parsed = json.loads(resp)
+        data = json.loads(resp)
+        if isinstance(data, list):
+            return [{"q": i["q"], "a": i["a"]} for i in data if "q" in i and "a" in i]
     except:
-        parsed = None
-    if isinstance(parsed, list):
-        cards = []
-        for p in parsed:
-            if "q" in p and "a" in p:
-                cards.append({"q": p["q"].strip(), "a": p["a"].strip()})
-        if cards:
-            return cards
-    lines = re.split(r'\n+', resp.strip())
+        pass
+
+    # Second try: line-based parsing
     cards = []
-    for line in lines:
-        m = re.match(r'^\s*Q[:\-\s]*(.*?)\s*[:\-]\s*A[:\-\s]*(.*)$', line)
-        if m:
-            cards.append({"q": m.group(1).strip(), "a": m.group(2).strip()})
+    blocks = re.split(r'Q[:\-–]\s*', resp, flags=re.I)
+    for block in blocks:
+        if not block.strip():
+            continue
+        parts = re.split(r'A[:\-–]\s*', block, maxsplit=1, flags=re.I)
+        if len(parts) == 2:
+            q = parts[0].strip()
+            a = parts[1].strip()
+            if q and a:
+                cards.append({"q": q, "a": a})
+
+    if not cards:
+        st.error("Could not parse flashcards. Try regenerating or check document clarity.")
     return cards
 
 def generate_adaptive_quiz(missed_texts, num_questions):
@@ -220,7 +236,12 @@ def revise_ui():
         answers = {}
         for i, q in enumerate(st.session_state.quiz_questions):
             st.subheader(f"Q{i+1}: {q['question']}")
-            answers[i] = st.radio("", q["options"], key=f"rev_q_{i}", index=st.session_state.get("quiz_answers", {}).get(i, 0))
+            prev_answer = st.session_state.get("quiz_answers", {}).get(i)
+            if isinstance(prev_answer, str) and prev_answer in q["options"]:
+                prev_index = q["options"].index(prev_answer)
+            else:
+                prev_index = 0
+            answers[i] = st.radio("", q["options"], key=f"rev_q_{i}", index=prev_index)
         if st.button("Submit Quiz"):
             score = 0
             misses = []
@@ -267,28 +288,63 @@ def revise_ui():
 
 def recommender_ui():
     st.title("Elective Recommender")
-    uploaded = st.file_uploader("Upload your electives list, syllabus, and structure (exactly 3 PDFs)", type=["pdf"], accept_multiple_files=True)
+
+    # Upload section
+    uploaded = st.file_uploader("Upload your electives list, syllabus, and structure (exactly 3 PDFs)",
+                                type=["pdf"], accept_multiple_files=True)
     if uploaded and len(uploaded) == 3 and st.button("Process Files"):
-        text = get_pdf_text(uploaded)
-        chunks = get_text_chunks(text)
-        get_vector_store(chunks)
-        st.session_state.elective_text = text
-        st.success("Processed successfully.")
+        with st.spinner("Processing..."):
+            text = get_pdf_text(uploaded)
+            chunks = get_text_chunks(text)
+            get_vector_store(chunks)
+            st.session_state.elective_text = text
+            st.success("Processed successfully. Context is now ready for recommendations!")
+
+    # Chat section
     st.write("Chat with the recommender below:")
     if "recommender_msgs" not in st.session_state:
-        st.session_state.recommender_msgs = [{"role": "assistant", "content": "Upload your elective files and tell me your preferences."}]
+        st.session_state.recommender_msgs = [
+            {"role": "assistant", "content": "Upload your elective PDFs and ask what electives suit your interests!"}
+        ]
+
     for msg in st.session_state.recommender_msgs:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
+
+    # Chat input logic
     if query := st.chat_input("Type your message..."):
         st.session_state.recommender_msgs.append({"role": "user", "content": query})
+
         with st.chat_message("assistant"):
             ensure_vector_store_ready()
+
+            # Use the FAISS index to get the relevant chunks
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+            db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+            docs = db.similarity_search(query, k=6)
+            context = " ".join([d.page_content for d in docs])
+
+            # Generate response grounded in the retrieved context
             model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", client=genai, temperature=0.5)
-            context = st.session_state.get("elective_text", "")
-            prompt = f"You are an academic advisor. Use the syllabus and elective info to recommend electives. Infer and reason; do not reply 'answer is not available in the context'. Elective info:\n{context}\nStudent query:\n{query}\nProvide structured recommendations with course name, domain, reasons, and prerequisites."
+            prompt = f"""
+You are an academic advisor. Use the following context from the syllabus and electives list to give reasoned, structured advice.
+Do not answer 'not in context' — infer and reason as needed, but stay consistent with the syllabus details.
+
+Context:
+{context[:12000]}
+
+Student query:
+{query}
+
+Respond with a structured answer covering:
+- Recommended courses (by name)
+- Domain or specialization area
+- Rationale for each recommendation
+- Any prerequisites or dependencies
+"""
             resp = model.invoke(prompt).content
             st.write(resp)
+
         st.session_state.recommender_msgs.append({"role": "assistant", "content": resp})
 
 def shared_upload_ui():
